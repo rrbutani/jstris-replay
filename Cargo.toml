@@ -1,0 +1,18 @@
+[package]
+name = "jstris-replay-re"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+lz-str = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_repr = "0.1"
+serde_with = { version = "2", features = ["base64"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1.21", features = ["macros", "rt-multi-thread"] }
