@@ -6,6 +6,8 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::{serde_as, base64::Base64};
 use thiserror::Error;
 
+pub mod rng;
+
 #[derive(Debug)]
 pub enum DecodeError {
     LzStrDecodeError,
@@ -61,6 +63,8 @@ pub struct Metadata {
 
     pub v: f32, // TODO: version?
     pub m: u8, // ???
+    //
+
     pub r: u16, // ???
 
     // todo: bbs? big blocks?
@@ -166,6 +170,12 @@ impl AsRef<[u8]> for GameSeed {
     }
 }
 
+impl AsRef<str> for GameSeed {
+    fn as_ref(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(self.bytes.as_ref()) }
+    }
+}
+
 impl Debug for GameSeed {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(fmt, "{self}")
@@ -175,7 +185,7 @@ impl Debug for GameSeed {
 impl Display for GameSeed {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(fmt, "\"")?;
-        for &c in self.as_ref() {
+        for &c in AsRef::<[u8]>::as_ref(&self.bytes) {
             write!(fmt, "{}", c as char)?
         }
         write!(fmt, "\"")
