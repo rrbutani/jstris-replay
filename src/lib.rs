@@ -3,7 +3,7 @@ use std::fmt::{self, Debug, Display};
 use chrono::{serde::ts_milliseconds, DateTime, Duration, Utc};
 use serde::{de::Error, Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use serde_with::{serde_as, base64::Base64};
+use serde_with::{base64::Base64, serde_as};
 use thiserror::Error;
 
 pub mod rng;
@@ -15,7 +15,7 @@ pub enum DecodeError {
 }
 
 #[serde_as]
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Replay {
     #[serde(rename = "c")]
     pub metadata: Metadata,
@@ -30,7 +30,7 @@ impl Replay {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Metadata {
     #[serde(rename = "softDropId")]
     pub soft_drop_id: SoftDropSpeed,
@@ -60,23 +60,95 @@ pub struct Metadata {
     #[serde(default)]
     pub arr: u16, // jstris allows [0, 4999]
 
+    #[serde(rename = "m")]
+    pub game_mode: GameMode, // ???
 
-    pub v: f32, // TODO: version?
-    pub m: u8, // ???
-    //
+    #[serde(rename = "v")]
+    pub version: ExpectedJstrisReplayVersion<3, 3>, // TODO: version; we assume 3.3?
+    // 40L mode
+    pub r: Option<u16>, // ???
 
-    pub r: u16, // ???
-
-    // todo: bbs? big blocks?
+                        // todo: bbs? big blocks?
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize_repr, Deserialize_repr)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ExpectedJstrisReplayVersion<const MAJOR: u8, const MINOR: u8>;
+
+impl<const MAJ: u8, const MIN: u8> Debug for ExpectedJstrisReplayVersion<MAJ, MIN> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f
+            .debug_struct("JstrisReplayVersion")
+            .field("major_ver", &MAJ)
+            .field("minor_ver", &MIN)
+            .finish()
+    }
+}
+
+
+impl<const MAJ: u8, const MIN: u8> Display for ExpectedJstrisReplayVersion<MAJ, MIN> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{MAJ}.{MIN}")
+    }
+}
+
+impl<const MAJ: u8, const MIN: u8> ExpectedJstrisReplayVersion<MAJ, MIN> {
+    pub const fn version(self) -> (u8, u8) {
+        (MAJ, MIN)
+    }
+}
+
+impl<const MAJ: u8, const MIN: u8> Serialize for ExpectedJstrisReplayVersion<MAJ, MIN> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let maj = MAJ as f32;
+        let mut min = MIN as f32;
+        while min >= 1. {
+            min /= 10.;
+        }
+
+        serializer.serialize_f32(maj + min)
+    }
+}
+
+impl<'de, const MAJ: u8, const MIN: u8> Deserialize<'de> for ExpectedJstrisReplayVersion<MAJ, MIN> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ver = f32::deserialize(deserializer)?;
+
+        // bleh
+        let ver = format!("{ver}");
+        let (maj, min) = ver.split_once('.').ok_or_else(|| D::Error::custom("invalid version number"))?;
+
+        let maj: u8 = maj.parse().map_err(D::Error::custom)?;
+        let min: u8 = min.parse().map_err(D::Error::custom)?;
+
+        if maj != MAJ {
+            return Err(<D::Error as serde::de::Error>::custom(format!(
+                "expected major version {MAJ}, got major version {maj} in `{ver}`"
+            )));
+        }
+        if min != MIN {
+            return Err(<D::Error as serde::de::Error>::custom(format!(
+                "expected minor version {MIN}, got minor version {min} in `{ver}`"
+            )));
+        }
+
+        Ok(Self)
+    }
+}
+
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize_repr, Deserialize_repr,
+)]
 #[repr(u16)]
 pub enum BlockSkin {
     SolidColor = 0,
     // Invisible = 1,  // not exposed via replay
     // Monochrome = 2, // not exposed via replay
-
     /// https://s.jezevec10.com/res/b1.png
     Bevel = 1,
     /// https://s.jezevec10.com/res/b2.png
@@ -101,7 +173,19 @@ pub enum BlockSkin {
 // TODO: missing numbers in the above?
 // TODO: inline images above!
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize_repr, Deserialize_repr, Default)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize_repr,
+    Deserialize_repr,
+    Default,
+)]
 #[repr(u8)]
 pub enum SoundEffects {
     Nullpomino = 0,
@@ -122,6 +206,33 @@ pub enum SoftDropSpeed {
     Fast = 2,
     Ultra = 3,
     Instant = 4,
+}
+
+impl SoftDropSpeed {
+    // https://harddrop.com/forums/index.php?showtopic=7087&st=135&p=92057&#entry92057
+    pub const fn steps(self) -> u8 {
+        use SoftDropSpeed::*;
+
+        match self {
+            Slow | Medium => 0,
+            Fast => 1,
+            Ultra => 2,
+            Instant => 20,
+        }
+    }
+}
+
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize_repr, Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum GameMode {
+    // TODO: non-sprint modes?
+    // See: https://harddrop.com/forums/index.php?showtopic=7087&st=135&p=92057&#entry92057
+    _40Line = 1,
+    _20Line = 2,
+    _100Line = 3,
+    _1000Line = 4,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -151,9 +262,7 @@ impl TryFrom<&str> for GameSeed {
         for (c, &b) in out.iter_mut().zip(str.as_bytes().iter()) {
             match b {
                 b'a'..=b'z' | b'0'..=b'9' => *c = b,
-                _ => {
-                    return Err(GameSeedParseError::InvalidChar { c: b })
-                }
+                _ => return Err(GameSeedParseError::InvalidChar { c: b }),
             }
         }
 
@@ -198,7 +307,9 @@ impl<'de> Deserialize<'de> for GameSeed {
         D: serde::Deserializer<'de>,
     {
         String::deserialize(deserializer)?
-            .as_str().try_into().map_err(D::Error::custom)
+            .as_str()
+            .try_into()
+            .map_err(D::Error::custom)
     }
 }
 

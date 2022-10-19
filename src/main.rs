@@ -32,11 +32,11 @@ async fn main() -> Result<(), Box<dyn Error + 'static>> {
 
         println!("{arg}: [{}] {res:#?}", res.time());
 
-        let mut rng = jstris_replay_re::rng::JstrisBag::new(res.metadata.seed);
+        // let mut rng = jstris_replay_re::rng::JstrisBag::new(res.metadata.seed);
 
-        for piece in rng.iter().take(50) {
-            println!("{piece:?}")
-        }
+        // for piece in rng.iter().take(50) {
+        //     println!("{piece:?}")
+        // }
     }
     // let replay = Replay {
     //     metadata: Metadata {

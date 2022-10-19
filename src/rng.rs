@@ -141,16 +141,15 @@ fn fresh_bag(rng: &mut AleaPrng) -> OneBag {
 
 impl JstrisBag {
     pub fn new(seed: crate::GameSeed) -> Self {
+        use std::mem::swap;
+
         let mut prng = AleaPrng::new([seed]);
         let mut bag = fresh_bag(&mut prng);
 
-        let arr = &mut *bag;
-        if let Some((s_or_z, other)) = match arr {
-            [.., other, S | Z, s @ (S | Z)] => Some((s, other)),
-            [.., other, s @ (S | Z)] => Some((s, other)),
-            _ => None,
-        } {
-            std::mem::swap(s_or_z, other);
+        match &mut *bag {
+            [.., other, S | Z, s @ (S | Z)] => swap(s, other),
+            [.., other, s @ (S | Z)] => swap(s, other),
+            _ => {},
         }
 
         Self { prng, bag }
