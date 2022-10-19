@@ -60,11 +60,25 @@ pub struct EventList {
     inner: Vec<Event>,
 }
 
-// impl Hash for EventList {
-//     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-//         self.inner.hash(state);
-//     }
-// }
+impl EventList {
+    // TODO: method on `JstrisReplay` that turns these durations into real times
+    // by adding the durations to the game start time
+    pub fn iter(&self) -> impl Iterator<Item = (Input, Duration)> + '_ {
+        let mut base = Duration::milliseconds(0);
+        let mut prev = 0;
+
+        self.inner.iter().map(move |&Event { timestamp, input }| {
+            if timestamp.millis() < prev {
+                // eprint!("{prev} -> {timestamp}; jumping base from {base} to:");
+                base = base + Duration::milliseconds(0x1000);
+                // eprintln!(" {base}");
+            }
+            prev = timestamp.millis();
+
+            (input, base + Duration::milliseconds(timestamp.millis() as _))
+        })
+    }
+}
 
 impl EventList {
     pub fn encode(&self) -> Vec<u8> {
@@ -162,8 +176,7 @@ impl TryFrom<Vec<u8>> for EventList {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Event {
-    raw: u16,
-    delay: TwelveBitMillisecondTimestamp,
+    timestamp: TwelveBitMillisecondTimestamp,
     input: Input,
 }
 
@@ -180,8 +193,7 @@ impl TryFrom<u16> for Event {
         // TODO: validation
 
         Ok(Event {
-            raw: value,
-            delay: delay.try_into().unwrap(),
+            timestamp: delay.try_into().unwrap(),
             input: Input::from_raw(input),
         })
     }
@@ -189,7 +201,7 @@ impl TryFrom<u16> for Event {
 
 impl From<Event> for u16 {
     fn from(ev: Event) -> u16 {
-        ev.delay.millis() << 4 | (ev.input as u16)
+        ev.timestamp.millis() << 4 | (ev.input as u16)
     }
 }
 
@@ -213,6 +225,30 @@ pub enum Input {
     ArrMove = 14,
     Aux = 15,
 }
+
+// impl Display for Input {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         use Input::*;
+//         match self {
+//             MoveLeft => "",
+//             MoveRight => todo!(),
+//             DasLeft => todo!(),
+//             DasRight => todo!(),
+//             RotateLeft => todo!(),
+//             RotateRight => todo!(),
+//             Rotate180 => todo!(),
+//             HardDrop => todo!(),
+//             SoftDropBeginEnd => todo!(),
+//             GravityStep => todo!(),
+//             HoldBlock => todo!(),
+//             GarbageAdd => todo!(),
+//             SGarbageAdd => todo!(),
+//             RedBarSet => todo!(),
+//             ArrMove => todo!(),
+//             Aux => todo!(),
+//         }
+//     }
+// }
 
 impl Input {
     #[inline]

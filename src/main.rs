@@ -2,12 +2,12 @@ use std::{
     env::args,
     error::Error,
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader}, collections::HashMap,
 };
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc, Duration};
 use jstris_replay_re::{
-    decode_uri_string, encode_uri_string, BlockSkin, Metadata, Replay, SoftDropSpeed,
+    decode_uri_string, encode_uri_string, BlockSkin, Metadata, JstrisReplay, SoftDropSpeed,
     SoundEffects, ExpectedJstrisReplayVersion, GameMode,
 };
 
@@ -32,13 +32,69 @@ async fn main() -> Result<(), Box<dyn Error + 'static>> {
 
         println!("{arg}: [{}] {res:#X?}", res.time());
 
+        let mut prev = Duration::milliseconds(0);
+        let fps = 30;
+        let mut total_err = Duration::milliseconds(0);
+
+        let mut frame_freq = HashMap::<_, usize>::new();
+        let mut input_freq = HashMap::<_, usize>::new();
+
+        for (inp, ts) in res.data.iter() {
+            let diff = ts - prev;
+            // let frames = (diff / (1000 / fps)).num_milliseconds();
+            let frames = (diff * fps / 1000).num_milliseconds();
+            let err = diff - Duration::milliseconds(((frames as i32) * 1000 / fps) as _);
+
+            let frames = if err.num_milliseconds() > (1000 / fps / 2) as _ {
+                frames + 1
+            } else {
+                frames
+            };
+
+            let err = diff - Duration::milliseconds(((frames as i32) * 1000 / fps) as _);
+
+            total_err = total_err + err;
+            prev = ts;
+            println!("  @{ts} [+{diff:7}, {frames:02}f e:{err}]: {inp:?}");
+
+            *frame_freq.entry(frames).or_default() += 1;
+            *input_freq.entry(inp).or_default() += 1;
+        }
+        println!("accumulated drift when mapping to frames: {total_err}");
+        println!("observed elapsed time: {} vs recorded: {} (err: {})", prev, res.time(), res.time() - prev);
+
+        let mut frame_freq: Vec<_> = frame_freq.into_iter().collect();
+        frame_freq.sort_by_key(|(_v, f)| *f);
+        println!("\nframe delays by frequency:");
+        for (v, f) in frame_freq.iter().rev() {
+            println!("  - {v:2} frames: {f:3}");
+        }
+
+        let mut input_freq: Vec<_> = input_freq.into_iter().collect();
+        input_freq.sort_by_key(|(_i, f)| *f);
+        println!("\ninputs by frequency:");
+        for (i, f) in input_freq.iter().rev() {
+            println!("  - {i: >15?}: {f:3}");
+        }
+
+        let bits = {
+            let bits_for_frame = frame_freq.len().next_power_of_two().trailing_zeros();
+            let bits_for_input = input_freq.len().next_power_of_two().trailing_zeros();
+            let len = res.data.len();
+
+            println!("\nnaïve: {bits_for_frame} bits for frame, {bits_for_input} bits for input, {len} events");
+            (bits_for_frame + bits_for_input) * (len as u32)
+        };
+        println!("  - {bits} bits, {} bytes", bits / 8 + if bits % 8 == 0 { 0 } else { 1 });
+
+
         // let mut rng = jstris_replay_re::rng::JstrisBag::new(res.metadata.seed);
 
         // for piece in rng.iter().take(50) {
         //     println!("{piece:?}")
         // }
     }
-    let replay = Replay {
+    let replay = JstrisReplay {
         metadata: Metadata {
             soft_drop_id: SoftDropSpeed::Instant,
             game_start: DateTime::from_utc(NaiveDateTime::from_timestamp(0, 0), Utc),
