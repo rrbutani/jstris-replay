@@ -1,32 +1,316 @@
-use std::fmt::{self, Debug, Display};
+use std::{
+    fmt::{self, Debug, Display},
+    hash::Hash,
+    num::NonZeroU16,
+};
 
 use chrono::{serde::ts_milliseconds, DateTime, Duration, Utc};
-use serde::{de::Error, Deserialize, Serialize};
+use derive_more::{Deref, DerefMut};
+use serde::{de::Error, Deserialize, Serialize, ser::SerializeStruct};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use serde_with::{base64::Base64, serde_as};
+use serde_with::{base64::Base64, serde_as, ser::SerializeAsWrap};
 use thiserror::Error;
 
 pub mod rng;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DecodeError {
+    #[error("error encountered when decoding the URI encoded LZ string")]
     LzStrDecodeError,
+    #[error("error encountered when decoding the embedded JSON data: {}", .0)]
     JsonDecodeError(serde_json::Error),
 }
 
 #[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct Replay {
     #[serde(rename = "c")]
     pub metadata: Metadata,
     #[serde(rename = "d")]
     #[serde_as(as = "Base64")]
-    pub data: Vec<u8>, // TODO
+    pub data: EventList, // TODO
+}
+
+// Manual serialize impl because `EventList` needs explicit encoding –– can't
+// provide an `AsRef<[u8]>` impl (see notes below about the Right Way to do
+// this).
+impl Serialize for Replay {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer {
+        let mut s = serializer.serialize_struct("Replay", 2)?;
+
+        s.serialize_field("c", &self.metadata)?;
+        let data = self.data.encode();
+        s.serialize_field("d", &SerializeAsWrap::<_, Base64>::new(&data))?;
+
+        s.end()
+    }
 }
 
 impl Replay {
     pub fn time(&self) -> Duration {
         self.metadata.game_end - self.metadata.game_start
+    }
+}
+
+// TODO: do this the Right Way: switch to having the in memory repr just be a
+// raw vec of `u8`s and do the translation to/from on "field" access
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deref, DerefMut)]
+pub struct EventList {
+    inner: Vec<Event>,
+}
+
+// impl Hash for EventList {
+//     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+//         self.inner.hash(state);
+//     }
+// }
+
+impl EventList {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(self.inner.capacity() * 2);
+
+        v.extend(
+            self.inner
+                .iter()
+                .flat_map(|&e| Into::<u16>::into(e).to_be_bytes()),
+        );
+
+        if self.inner.len() % 2 == 1 {
+            v.extend([ 0, 0 ]);
+            // TODO: do we really need to pad here?
+        }
+
+        v
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
+pub enum EventListParseError {
+    #[error("events are four bytes each; got {num_bytes} bytes which is not a multiple of 4")]
+    NotAligned { num_bytes: usize },
+    #[error("error decoding event: {}", .0)]
+    EventDecodeError(#[from] EventDecodeError),
+}
+
+impl TryFrom<Vec<u8>> for EventList {
+    type Error = EventListParseError;
+
+    fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
+        /*
+        // debug_assert_eq!(std::mem::size_of::<Event>(), 4);
+
+        // if bytes.len() % 4 != 0 {
+        //     return Err(EventListParseError::NotAligned { num_bytes: bytes.len() })
+        // }
+
+        // // We want to reuse the `bytes` Vec instead of making a copy.
+        // let elems = bytes.len() / 4;
+
+        // // We're going to do an unsafe cast to produce a `Vec<Event>`; to do
+        // // this we have to make sure the `byte` vec's underlying allocation is
+        // // a multiple of 4 bytes.
+        // bytes.shrink_to_fit();
+        // if bytes.capacity() != elems * 4 { panic!("couldn't shrink the bytes vector!"); }
+
+        // let (ptr, len, cap) = bytes.into_raw_parts();
+        // TODO: store a raw pointer instead and reconstruct the vector on drop
+        // the above is not sound because the alignment of `Event` isn't the
+        // same as `u8` so we can't just dealloc as normal.
+        */
+
+        // TODO: do we really need a multiple of 4 bytes (i.e. pairs of events)?
+
+        if bytes.len() % 4 != 0 {
+            return Err(EventListParseError::NotAligned {
+                num_bytes: bytes.len(),
+            });
+        }
+
+        let inner = bytes
+            // .array_chunks() // not stable yet
+            .chunks(2)
+            .map(|arr| arr.try_into().unwrap())
+            .map(u16::from_be_bytes)
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
+
+        // Ok(EventList { inner, _encoded: RefCell::new(None) })
+        Ok(EventList { inner })
+    }
+}
+
+// impl DerefMut for EventList {
+//     fn deref_mut(&mut self) -> &mut Self::Target {
+//         // Drop the cached encoded form if there's potential the actual data
+//         // will be modified:
+//         self._encoded.get_mut().take();
+//         &mut self.inner
+//     }
+// }
+
+// impl AsRef<[u8]> for EventList {
+//     fn as_ref(&self) -> &[u8] {
+//         if let Some(inner) = *self._encoded.borrow() {
+//             inner
+//         } else {
+//             *self._encoded.borrow_mut() = Some(self.encode());
+//             self._encoded.borrow()
+//         }
+//     }
+// }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Event {
+    raw: u16,
+    delay: Option<TwelveBitMillisecondDelay>,
+    input: Input,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
+pub enum EventDecodeError {}
+
+impl TryFrom<u16> for Event {
+    type Error = EventDecodeError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        let delay = value >> 4;
+        let input = (value & 0x0F) as u8;
+
+        Ok(Event {
+            raw: value,
+            delay: TwelveBitMillisecondDelay::new(delay).unwrap(),
+            input: Input::from_raw(input),
+        })
+    }
+}
+
+impl From<Event> for u16 {
+    fn from(ev: Event) -> u16 {
+        ev.delay.map(|v| v.millis()).unwrap_or(0xF_FF) << 4 | (ev.input as u16)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum Input {
+    MoveLeft = 0,
+    MoveRight = 1,
+    DasLeft = 2,
+    DasRight = 3,
+    RotateLeft = 4,
+    RotateRight = 5,
+    Rotate180 = 6,
+    HardDrop = 7,
+    SoftDropBeginEnd = 8,
+    GravityStep = 9,
+    HoldBlock = 10,
+    GarbageAdd = 11,
+    SGarbageAdd = 12,
+    RedBarSet = 13,
+    ArrMove = 14,
+    Aux = 15,
+}
+
+impl Input {
+    #[inline]
+    pub fn from_raw(raw: u8) -> Self {
+        assert!(raw & 0xF0 == 0);
+        // debug_assert!(disc) variant_count == 16
+
+        unsafe { core::mem::transmute(raw) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum AuxInput {
+    Afk = 0,
+    BlockSet = 1,
+    MoveTo = 2,
+    Randomizer = 3,
+    MatrixMod = 4,
+    WideGarbageMod = 5,
+}
+
+/// 4095 milliseconds is represented as `None` in [`Event`]; we shift all the
+/// values up by 1 (i.e. `4095` is represented as `0`, `0` is represented as `1`
+/// and so on) so we can make use of the niche optimization [`NonZeroU16`] has.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TwelveBitMillisecondDelay(NonZeroU16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+pub enum TwelveBitMillisecondDelayConversionError<Source: Display = u16> {
+    TooBig { duration: Source },
+    RequiresContinuation, // for delays that are exactly 0x0F_FF milliseconds
+    Invalid { duration: Source },
+}
+
+impl TryFrom<Duration> for TwelveBitMillisecondDelay {
+    type Error = TwelveBitMillisecondDelayConversionError<Duration>;
+
+    fn try_from(duration: Duration) -> Result<Self, Self::Error> {
+        use TwelveBitMillisecondDelayConversionError as E;
+
+        match duration.num_milliseconds() {
+            0x0F_FF => Err(E::RequiresContinuation),
+            val @ 0..=0x0F_FF => Ok(Self(NonZeroU16::new((val as u16) + 1).unwrap())),
+            val if val.is_positive() => Err(E::TooBig { duration }),
+            _ => Err(E::Invalid { duration }),
+        }
+    }
+}
+
+impl From<TwelveBitMillisecondDelay> for Duration {
+    fn from(delay: TwelveBitMillisecondDelay) -> Duration {
+        Duration::milliseconds(delay.0.get() as _)
+    }
+}
+
+impl TryFrom<u16> for TwelveBitMillisecondDelay {
+    type Error = TwelveBitMillisecondDelayConversionError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        use TwelveBitMillisecondDelayConversionError as E;
+
+        match value {
+            0x0F_FF => Err(E::RequiresContinuation),
+            0..=0x0F_FF => Ok(Self(NonZeroU16::new(value + 1).unwrap())),
+            _ => Err(E::TooBig { duration: value }),
+        }
+    }
+}
+
+impl TwelveBitMillisecondDelay {
+    pub fn new(val: u16) -> Result<Option<Self>, TwelveBitMillisecondDelayConversionError> {
+        use TwelveBitMillisecondDelayConversionError::RequiresContinuation;
+
+        match val.try_into() {
+            Ok(val) => Ok(Some(val)),
+            Err(RequiresContinuation) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl TwelveBitMillisecondDelay {
+    pub const fn millis(self) -> u16 {
+        self.0.get() - 1
+    }
+}
+
+impl Debug for TwelveBitMillisecondDelay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("TwelveBitMillisecondDelay")
+            .field(&self.millis())
+            .finish()
+    }
+}
+
+impl Display for TwelveBitMillisecondDelay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", Into::<Duration>::into(*self))
     }
 }
 
@@ -64,36 +348,50 @@ pub struct Metadata {
     pub game_mode: GameMode, // ???
 
     #[serde(rename = "v")]
-    pub version: ExpectedJstrisReplayVersion<3, 3>, // TODO: version; we assume 3.3?
-    // 40L mode
+    pub version: ExpectedJstrisReplayVersion<3, 0>, // we're compatible with 3.0 and up (tested through 3.3)
+
     pub r: Option<u16>, // ???
 
-                        // todo: bbs? big blocks?
+    // todo: bbs? big blocks?
+    pub bbs: Option<u8>, // todo: this should actually be a bool on our end but
+                         // not on the wire?
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct ExpectedJstrisReplayVersion<const MAJOR: u8, const MINOR: u8>;
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExpectedJstrisReplayVersion<const MAJOR: u8 = 3, const MINOR: u8 = 3> {
+    actual_minor: u8,
+}
 
 impl<const MAJ: u8, const MIN: u8> Debug for ExpectedJstrisReplayVersion<MAJ, MIN> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f
-            .debug_struct("JstrisReplayVersion")
+        f.debug_struct("JstrisReplayVersion")
             .field("major_ver", &MAJ)
-            .field("minor_ver", &MIN)
+            .field("minor_ver", &self.actual_minor)
             .finish()
     }
 }
 
-
 impl<const MAJ: u8, const MIN: u8> Display for ExpectedJstrisReplayVersion<MAJ, MIN> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{MAJ}.{MIN}")
+        write!(f, "{MAJ}.{}", self.actual_minor)
+    }
+}
+
+impl<const MIN: u8> Default for ExpectedJstrisReplayVersion<3, MIN> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const MIN: u8> ExpectedJstrisReplayVersion<3, MIN> {
+    pub const fn new() -> Self {
+        Self { actual_minor: 3 }
     }
 }
 
 impl<const MAJ: u8, const MIN: u8> ExpectedJstrisReplayVersion<MAJ, MIN> {
     pub const fn version(self) -> (u8, u8) {
-        (MAJ, MIN)
+        (MAJ, self.actual_minor)
     }
 }
 
@@ -121,23 +419,27 @@ impl<'de, const MAJ: u8, const MIN: u8> Deserialize<'de> for ExpectedJstrisRepla
 
         // bleh
         let ver = format!("{ver}");
-        let (maj, min) = ver.split_once('.').ok_or_else(|| D::Error::custom("invalid version number"))?;
+        let (maj, min) = if let Some(pair) = ver.split_once('.') {
+            pair
+        } else {
+            (&*ver, "0")
+        };
 
         let maj: u8 = maj.parse().map_err(D::Error::custom)?;
         let min: u8 = min.parse().map_err(D::Error::custom)?;
 
         if maj != MAJ {
             return Err(<D::Error as serde::de::Error>::custom(format!(
-                "expected major version {MAJ}, got major version {maj} in `{ver}`"
+                "expected major version {MAJ}, got major version {maj} in version number `{ver}`"
             )));
         }
-        if min != MIN {
+        if !(min >= MIN) {
             return Err(<D::Error as serde::de::Error>::custom(format!(
-                "expected minor version {MIN}, got minor version {min} in `{ver}`"
+                "expected minor version {MIN}, got minor version {min} in version number `{ver}`"
             )));
         }
 
-        Ok(Self)
+        Ok(Self { actual_minor: min })
     }
 }
 
