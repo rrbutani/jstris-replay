@@ -1,7 +1,6 @@
 use std::{
     fmt::{self, Debug, Display},
     hash::Hash,
-    num::NonZeroU16,
 };
 
 use chrono::{serde::ts_milliseconds, DateTime, Duration, Utc};
@@ -23,7 +22,7 @@ pub enum DecodeError {
 
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
-pub struct Replay {
+pub struct JstrisReplay {
     #[serde(rename = "c")]
     pub metadata: Metadata,
     #[serde(rename = "d")]
@@ -34,7 +33,7 @@ pub struct Replay {
 // Manual serialize impl because `EventList` needs explicit encoding –– can't
 // provide an `AsRef<[u8]>` impl (see notes below about the Right Way to do
 // this).
-impl Serialize for Replay {
+impl Serialize for JstrisReplay {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer {
@@ -48,7 +47,7 @@ impl Serialize for Replay {
     }
 }
 
-impl Replay {
+impl JstrisReplay {
     pub fn time(&self) -> Duration {
         self.metadata.game_end - self.metadata.game_start
     }
@@ -164,7 +163,7 @@ impl TryFrom<Vec<u8>> for EventList {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Event {
     raw: u16,
-    delay: Option<TwelveBitMillisecondDelay>,
+    delay: TwelveBitMillisecondTimestamp,
     input: Input,
 }
 
@@ -178,9 +177,11 @@ impl TryFrom<u16> for Event {
         let delay = value >> 4;
         let input = (value & 0x0F) as u8;
 
+        // TODO: validation
+
         Ok(Event {
             raw: value,
-            delay: TwelveBitMillisecondDelay::new(delay).unwrap(),
+            delay: delay.try_into().unwrap(),
             input: Input::from_raw(input),
         })
     }
@@ -188,7 +189,7 @@ impl TryFrom<u16> for Event {
 
 impl From<Event> for u16 {
     fn from(ev: Event) -> u16 {
-        ev.delay.map(|v| v.millis()).unwrap_or(0xF_FF) << 4 | (ev.input as u16)
+        ev.delay.millis() << 4 | (ev.input as u16)
     }
 }
 
@@ -234,81 +235,54 @@ pub enum AuxInput {
     WideGarbageMod = 5,
 }
 
-/// 4095 milliseconds is represented as `None` in [`Event`]; we shift all the
-/// values up by 1 (i.e. `4095` is represented as `0`, `0` is represented as `1`
-/// and so on) so we can make use of the niche optimization [`NonZeroU16`] has.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TwelveBitMillisecondDelay(NonZeroU16);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TwelveBitMillisecondTimestamp(u16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
-pub enum TwelveBitMillisecondDelayConversionError<Source: Display = u16> {
+pub enum TwelveBitMillisecondTimestampConversionError<Source: Display = u16> {
     TooBig { duration: Source },
-    RequiresContinuation, // for delays that are exactly 0x0F_FF milliseconds
     Invalid { duration: Source },
 }
 
-impl TryFrom<Duration> for TwelveBitMillisecondDelay {
-    type Error = TwelveBitMillisecondDelayConversionError<Duration>;
+impl TryFrom<Duration> for TwelveBitMillisecondTimestamp {
+    type Error = TwelveBitMillisecondTimestampConversionError<Duration>;
 
     fn try_from(duration: Duration) -> Result<Self, Self::Error> {
-        use TwelveBitMillisecondDelayConversionError as E;
+        use TwelveBitMillisecondTimestampConversionError as E;
 
         match duration.num_milliseconds() {
-            0x0F_FF => Err(E::RequiresContinuation),
-            val @ 0..=0x0F_FF => Ok(Self(NonZeroU16::new((val as u16) + 1).unwrap())),
-            val if val.is_positive() => Err(E::TooBig { duration }),
+            val if val.is_positive() => Ok(Self(val as u16)),
             _ => Err(E::Invalid { duration }),
         }
     }
 }
 
-impl From<TwelveBitMillisecondDelay> for Duration {
-    fn from(delay: TwelveBitMillisecondDelay) -> Duration {
-        Duration::milliseconds(delay.0.get() as _)
+impl From<TwelveBitMillisecondTimestamp> for Duration {
+    fn from(timestamp: TwelveBitMillisecondTimestamp) -> Duration {
+        Duration::milliseconds(timestamp.0 as _)
     }
 }
 
-impl TryFrom<u16> for TwelveBitMillisecondDelay {
-    type Error = TwelveBitMillisecondDelayConversionError;
+impl TryFrom<u16> for TwelveBitMillisecondTimestamp {
+    type Error = TwelveBitMillisecondTimestampConversionError;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        use TwelveBitMillisecondDelayConversionError as E;
+        use TwelveBitMillisecondTimestampConversionError as E;
 
         match value {
-            0x0F_FF => Err(E::RequiresContinuation),
-            0..=0x0F_FF => Ok(Self(NonZeroU16::new(value + 1).unwrap())),
+            0..=0x0F_FF => Ok(Self(value)),
             _ => Err(E::TooBig { duration: value }),
         }
     }
 }
 
-impl TwelveBitMillisecondDelay {
-    pub fn new(val: u16) -> Result<Option<Self>, TwelveBitMillisecondDelayConversionError> {
-        use TwelveBitMillisecondDelayConversionError::RequiresContinuation;
-
-        match val.try_into() {
-            Ok(val) => Ok(Some(val)),
-            Err(RequiresContinuation) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-}
-
-impl TwelveBitMillisecondDelay {
+impl TwelveBitMillisecondTimestamp {
     pub const fn millis(self) -> u16 {
-        self.0.get() - 1
+        self.0
     }
 }
 
-impl Debug for TwelveBitMillisecondDelay {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("TwelveBitMillisecondDelay")
-            .field(&self.millis())
-            .finish()
-    }
-}
-
-impl Display for TwelveBitMillisecondDelay {
+impl Display for TwelveBitMillisecondTimestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", Into::<Duration>::into(*self))
     }
@@ -624,7 +598,7 @@ impl Serialize for GameSeed {
     }
 }
 
-pub fn decode_uri_string(replay_uri_string: impl AsRef<[u8]>) -> Result<Replay, DecodeError> {
+pub fn decode_uri_string(replay_uri_string: impl AsRef<[u8]>) -> Result<JstrisReplay, DecodeError> {
     let bytes = replay_uri_string.as_ref();
     let compressed = bytes.iter().copied().map(u32::from).collect::<Vec<_>>();
 
@@ -632,11 +606,11 @@ pub fn decode_uri_string(replay_uri_string: impl AsRef<[u8]>) -> Result<Replay, 
     decode_json(str)
 }
 
-pub fn decode_json(json: impl AsRef<str>) -> Result<Replay, DecodeError> {
-    serde_json::from_str::<Replay>(json.as_ref()).map_err(DecodeError::JsonDecodeError)
+pub fn decode_json(json: impl AsRef<str>) -> Result<JstrisReplay, DecodeError> {
+    serde_json::from_str::<JstrisReplay>(json.as_ref()).map_err(DecodeError::JsonDecodeError)
 }
 
-pub fn encode_uri_string(replay: &Replay) -> Result<String, serde_json::Error> {
+pub fn encode_uri_string(replay: &JstrisReplay) -> Result<String, serde_json::Error> {
     let json = serde_json::to_string(replay)?;
     let vec = lz_str::compress_uri(&json);
     Ok(vec.iter().map(|c| char::try_from(*c).unwrap()).collect())
