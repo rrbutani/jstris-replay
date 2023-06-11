@@ -1,22 +1,104 @@
 use std::{
+    collections::HashMap,
     env::args,
     error::Error,
     fs::File,
-    io::{BufRead, BufReader}, collections::HashMap,
+    io::{BufRead, BufReader},
 };
 
-use chrono::{DateTime, NaiveDateTime, Utc, Duration};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use jstris_replay_re::{
-    decode_uri_string, encode_uri_string, BlockSkin, Metadata, JstrisReplay, SoftDropSpeed,
-    SoundEffects, ExpectedJstrisReplayVersion, GameMode,
+    decode_uri_string, encode_uri_string, BlockSkin, ExpectedJstrisReplayVersion, GameMode,
+    JstrisReplay, Metadata, SoftDropSpeed, SoundEffects, decode_json,
 };
+use soup::{NodeExt, QueryBuilderExt};
+
+struct JstrisLeaderboardIter {
+    remaining: Vec<u32>, // replay ids, reverse order! (worst ... best)
+    next_page: String,   // worst time seen so far..
+}
+
+impl JstrisLeaderboardIter {
+    fn new() -> Self {
+        Self {
+            remaining: Vec::with_capacity(200),
+            next_page: "0.0".to_string(),
+        }
+    }
+
+    async fn next(&mut self) -> reqwest::Result<Option<String>> {
+        let next = if let Some(next) = self.remaining.pop() {
+            next
+        } else {
+            // grab the next page!
+            let page = reqwest::get(format!(
+                "https://jstris.jezevec10.com/sprint?lines=40L&page={}",
+                self.next_page
+            ))
+            .await?
+            .text()
+            .await?;
+
+            let soup = soup::Soup::new(&page);
+            let m = soup
+                .tag("a")
+                .attr("target", "_blank")
+                .find_all()
+                .map(|x| {
+                    let link = x.get("href").unwrap();
+                    (x, link)
+                })
+                .filter(|(_, link)| link.contains("replay"))
+                .map(|(elem, link)| {
+                    let siblings = elem
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .tag("td")
+                        .find_all()
+                        .collect::<Vec<_>>();
+                    let time = siblings[2].tag("strong").find().unwrap().text();
+
+                    let replay_id = link
+                        .strip_prefix("https://jstris.jezevec10.com/replay/")
+                        .unwrap()
+                        .to_string();
+
+                    (time, replay_id)
+                })
+                .collect::<Vec<_>>();
+
+            let last = m.last().unwrap();
+            self.next_page = last.0.clone();
+
+
+            let iter = m.into_iter()
+                .rev()
+                .map(|(_, replay_id)| replay_id.parse::<u32>().unwrap());
+
+            self.remaining.extend(iter);
+
+            println!("got next page of leaderboard: {} entries", self.remaining.len());
+            self.remaining.pop().unwrap()
+        };
+
+        Ok(Some(format!("replay:{next}")))
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + 'static>> {
-    for arg in args().skip(1) {
+    decode_json(r#"{"c":{"v":3.3,"softDropId":4,"gameStart":1684543650931,"gameEnd":1684543666545,"seed":"c07yl8j","m":1,"bs":0,"se":0,"das":83,"r":0},"d":"AeAD5wcyDacP0BQ3FRIWWhZSGVUZUhwXHZEi4yRXJFMmeiZzKRAsRyy6LdEuJjMTOFc61T4nQBFFU0nHS+RQZ1CxVgNYMFlXWvpcRlzRYhNkF2WgaHVq8mz3bZputHKAdId3wnv3e\/J+NoK3hZGK0433jfOU15aanRGdhaIXqHeqKq31rvCyJ7UgulK+J74iv7q\/ssenyeXNp88m0IHVs9fX2Yrc8d1l4PfjdORw6bfr1fAn8jH3c\/in+KP6ivqD\/iAAlwDWAyEIYwp3CnMLwBECEtcU5BfhGucc9CEwI6coRSqXLoAz0jXhO8c9mkAkQyBIYk73XEZc8GJCZLFpx221bjFxV3OReNN8B3wDgaeCuoVWigeMEJFik1GVJ5cwmgWccp5Hn7ahQaaDqoeuMLJHtCW397sRwFPDp8W0x8HKp8zx0jPWt9qF2oHeF98g44XkYufH58LqdO3R8Ify2vPk+AD8RwBVAecEOgZAC5IPdxHxEpUWlx53IOAmMiyHLso25zlkPVBAJ0NBQ1ZIg0vnTfpPQFSCWRdaQVrlX4dgoWXjaCdoI2paalNvYHFHc1p0snZ1dpJ593qmfdGDE4U3hqSJgIzHjvGUQ5cnlyOcl57Kn\/Cj9aVSqfep8q4RrrWyF7QatkW2QbvHvaq\/kMTSyMXLl9Gn1iTcB+E15EflsOnF6wLup+\/28ZH2w\/dX91P5evlzAGcAYwJKAkMIRwhDCUoJQwpWEbcTkBjSHTce8R9VI6ck0CoyLWcvATRTNec14ziqOKM\/xz\/DQRpBE0HmSadMFFPXX8Ff5WNXapdx4HYXeGZ60IEXhJCJ4o+3lPGVFZjXndCgB6Pgp3WpIq0nsqGzBbXXu5e\/BsSHx9rH4MkkzRLO0c\/n\/\/A="}"#).unwrap();
+
+    // for arg in args().skip(1) {
+    let mut replays = JstrisLeaderboardIter::new();
+    while let Some(arg) = replays.next().await? {
         let res = if let Some(replay_id) = arg.strip_prefix("replay:") {
+            println!("fetching replay: {replay_id}...");
             reqwest::get(format!(
                 "https://jstris.jezevec10.com/replay/data?id={replay_id}&type=0"
+                // "https://jstris.jezevec10.com/replay/data?id=70293904&type=0"
             ))
             .await?
             .json()
@@ -29,6 +111,12 @@ async fn main() -> Result<(), Box<dyn Error + 'static>> {
 
             decode_uri_string(s.as_bytes()).unwrap()
         };
+
+        if res.metadata.arr != 0 {
+            println!("non-zero arr! ({arg})");
+        } else {
+            continue;
+        }
 
         println!("{arg}: [{}] {res:#X?}", res.time());
 
@@ -61,7 +149,12 @@ async fn main() -> Result<(), Box<dyn Error + 'static>> {
             *input_freq.entry(inp).or_default() += 1;
         }
         println!("accumulated drift when mapping to frames: {total_err}");
-        println!("observed elapsed time: {} vs recorded: {} (err: {})", prev, res.time(), res.time() - prev);
+        println!(
+            "observed elapsed time: {} vs recorded: {} (err: {})",
+            prev,
+            res.time(),
+            res.time() - prev
+        );
 
         let mut frame_freq: Vec<_> = frame_freq.into_iter().collect();
         frame_freq.sort_by_key(|(_v, f)| *f);
@@ -85,8 +178,10 @@ async fn main() -> Result<(), Box<dyn Error + 'static>> {
             println!("\nnaïve: {bits_for_frame} bits for frame, {bits_for_input} bits for input, {len} events");
             (bits_for_frame + bits_for_input) * (len as u32)
         };
-        println!("  - {bits} bits, {} bytes", bits / 8 + if bits % 8 == 0 { 0 } else { 1 });
-
+        println!(
+            "  - {bits} bits, {} bytes",
+            bits / 8 + if bits % 8 == 0 { 0 } else { 1 }
+        );
 
         // let mut rng = jstris_replay_re::rng::JstrisBag::new(res.metadata.seed);
 
@@ -94,6 +189,9 @@ async fn main() -> Result<(), Box<dyn Error + 'static>> {
         //     println!("{piece:?}")
         // }
     }
+
+    return Ok(());
+
     let replay = JstrisReplay {
         metadata: Metadata {
             soft_drop_id: SoftDropSpeed::Instant,
@@ -109,10 +207,14 @@ async fn main() -> Result<(), Box<dyn Error + 'static>> {
             r: Some(1),
             bbs: None,
         },
-        data: vec![ // needs to be a multiple of 4
+        data: vec![
+            // needs to be a multiple of 4
             // 20, 241, 38, 103,
             // 0b0001_0100, 0b1111_0001, 0b0010_0110, 0b0110_0111,
-            0b0000_0000, 0b0000_0000, 0b0000_0000, 0b0001_1111,
+            0b0000_0000,
+            0b0000_0000,
+            0b0000_0000,
+            0b0001_1111,
             /*
                 0..3
 
@@ -180,8 +282,6 @@ async fn main() -> Result<(), Box<dyn Error + 'static>> {
 
 
             */
-
-
             // 39, 46, 150, 48,
             // 164, 64, 39, 178,
             // 40, 247, 23, 150,
@@ -217,7 +317,9 @@ async fn main() -> Result<(), Box<dyn Error + 'static>> {
             // 157, 214, 250, 248, 98, 253, 73, 33, 193, 59, 111, 69, 161, 79, 9, 82, 67, 107, 129,
             // 108, 169, 127, 65, 129, 169, 146, 28, 205, 151, 206, 62, 104, 192, 236, 202, 109, 95,
             // 118, 243, 189, 50, 254, 90, 31, 32, 130, 4, 2, 180, 224,
-        ].try_into().unwrap(),
+        ]
+        .try_into()
+        .unwrap(),
     };
     let replay_str = encode_uri_string(&replay)?;
     println!("{replay_str}");

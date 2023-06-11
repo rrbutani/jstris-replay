@@ -549,14 +549,19 @@ pub enum GameMode {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GameSeed {
-    bytes: [u8; 6],
+    bytes: [u8; Self::MAX_LEN],
     len: u8,
+}
+
+impl GameSeed {
+    // replay:607532
+    pub const MAX_LEN: usize = 10;
 }
 
 #[derive(Debug, Error)]
 pub enum GameSeedParseError {
-    #[error("expected 6 or fewer (but not zero) bytes in the string")]
-    WrongLength,
+    #[error("expected {} or fewer (but not zero) bytes in the string; got {} bytes", GameSeed::MAX_LEN, len)]
+    WrongLength { len: usize },
     #[error("{} is not alphanum", *c as char)]
     InvalidChar { c: u8 },
 }
@@ -565,11 +570,11 @@ impl TryFrom<&str> for GameSeed {
     type Error = GameSeedParseError;
 
     fn try_from(str: &str) -> Result<Self, Self::Error> {
-        if str.len() > 6 || str.is_empty() {
-            return Err(GameSeedParseError::WrongLength);
+        if str.len() > Self::MAX_LEN || str.is_empty() {
+            return Err(GameSeedParseError::WrongLength { len: str.len() });
         }
 
-        let mut out = [0; 6];
+        let mut out = [0; Self::MAX_LEN];
 
         for (c, &b) in out.iter_mut().zip(str.as_bytes().iter()) {
             match b {
